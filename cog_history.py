@@ -16,11 +16,22 @@ Usage :
     python cog_history.py --canton 73-05 --html can.html  # Arbre HTML canton
 """
 
-import argparse, csv, json, sys, urllib.request, webbrowser
+import argparse, csv, json, sys, urllib.request, webbrowser, unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
+
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+def _normalize(s):
+    """Normalise une chaîne pour la comparaison (minuscules, sans accents)."""
+    s = unicodedata.normalize("NFD", s.lower())
+    return "".join(c for c in s if unicodedata.category(c) != "Mn")
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -136,6 +147,25 @@ class Annuaire:
         print(f"{S.D}Annuaire : {len(self._fiches)} communes{S.R}", file=sys.stderr)
 
     def get(self, code): return self._fiches.get(code)
+
+    def search_name(self, name, limit=10):
+        """Recherche par nom de commune (insensible casse/accents, par mots)."""
+        q = _normalize(name)
+        q_words = q.replace("-", " ").split()
+        scored = []
+        for f in self._fiches.values():
+            n = _normalize(f.libelle)
+            n_words = n.replace("-", " ").split()
+            if q == n:
+                scored.append((0, f))  # exact
+            elif n.startswith(q) or n.replace("-", " ").startswith(q):
+                scored.append((1, f))  # commence par
+            elif all(any(nw.startswith(qw) for nw in n_words) for qw in q_words):
+                scored.append((2, f))  # tous les mots matchent un début de mot
+            elif all(any(qw in nw for nw in n_words) for qw in q_words) and len(q) >= 4:
+                scored.append((3, f))  # sous-chaîne, si requête assez longue
+        scored.sort(key=lambda x: (x[0], x[1].code))
+        return [f for _, f in scored[:limit]]
 
     def filter(self, dep=None, arr=None, canton=None):
         """Filtre les communes par département, arrondissement ou canton.
@@ -862,6 +892,105 @@ def show_stats(db):
         print(f"  MOD {mod:>2} │ {n:>6,} │ {MOD_LABELS.get(mod, '?')}")
     print()
 
+# ── Lecture/écriture CSV/XLSX ─────────────────────────────────────────────────
+
+def _read_table(path: Path):
+    """Lit un CSV ou XLSX et retourne (fieldnames, rows)."""
+    ext = path.suffix.lower()
+    if ext in (".xlsx", ".xls"):
+        if not HAS_OPENPYXL:
+            print(f"{S.RD}openpyxl requis pour les fichiers Excel : pip install openpyxl{S.R}")
+            sys.exit(1)
+        wb = openpyxl.load_workbook(path, read_only=True)
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+        headers = [str(c or "") for c in next(rows_iter)]
+        rows = [dict(zip(headers, (str(c) if c is not None else "" for c in r))) for r in rows_iter]
+        wb.close()
+        return headers, rows
+    else:
+        with open(path, encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            return list(reader.fieldnames or []), list(reader)
+
+def _write_table(path: Path, fieldnames, rows):
+    """Écrit un CSV ou XLSX."""
+    ext = path.suffix.lower()
+    if ext in (".xlsx", ".xls"):
+        if not HAS_OPENPYXL:
+            print(f"{S.RD}openpyxl requis pour les fichiers Excel : pip install openpyxl{S.R}")
+            sys.exit(1)
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(fieldnames)
+        for row in rows:
+            ws.append([row.get(f, "") for f in fieldnames])
+        wb.save(path)
+    else:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+
+# ── Enrichissement de fichiers ───────────────────────────────────────────────
+
+def enrichir_fichier(input_path: Path, output_path: Path, col_code: str,
+                     annuaire: Annuaire, db: MvtDB, depuis=None):
+    """Enrichit un CSV/XLSX en ajoutant les infos communales et l'historique."""
+    headers, rows = _read_table(input_path)
+
+    if col_code not in headers:
+        print(f"{S.RD}Colonne '{col_code}' absente. Colonnes disponibles : {', '.join(headers)}{S.R}")
+        sys.exit(1)
+
+    extra_cols = ["cog_nom", "cog_type", "cog_departement", "cog_dep_code",
+                  "cog_region", "cog_arrondissement", "cog_canton",
+                  "cog_nb_evenements", "cog_nb_absorbees", "cog_code_actuel"]
+    out_fields = headers + extra_cols
+
+    total = len(rows)
+    for i, row in enumerate(rows, 1):
+        code = str(row.get(col_code, "")).strip().zfill(5)
+        if not code or code == "00000":
+            continue
+
+        print(f"\r{S.D}  [{i}/{total}] {code}{S.R}", end="", file=sys.stderr)
+
+        fiche = annuaire.get(code)
+        tracer = Tracer(db, depuis=depuis)
+        result = tracer.trace(code)
+
+        if fiche:
+            row["cog_nom"] = fiche.libelle
+            row["cog_type"] = fiche.typecom
+            row["cog_departement"] = fiche.dep_nom
+            row["cog_dep_code"] = fiche.dep_code
+            row["cog_region"] = fiche.reg_nom
+            row["cog_arrondissement"] = fiche.arr_nom
+            row["cog_canton"] = fiche.can_nom
+        elif len(result["identites"]) > 1:
+            # Code historique → chercher la fiche du successeur
+            last = result["identites"][-1]
+            fiche_succ = annuaire.get(last)
+            if fiche_succ:
+                row["cog_nom"] = fiche_succ.libelle
+                row["cog_type"] = fiche_succ.typecom
+                row["cog_departement"] = fiche_succ.dep_nom
+                row["cog_dep_code"] = fiche_succ.dep_code
+                row["cog_region"] = fiche_succ.reg_nom
+                row["cog_arrondissement"] = fiche_succ.arr_nom
+                row["cog_canton"] = fiche_succ.can_nom
+            row["cog_code_actuel"] = last
+
+        row["cog_nb_evenements"] = str(len(result["directs"]))
+        row["cog_nb_absorbees"] = str(count_abs(result["absorbees"]))
+        if not row.get("cog_code_actuel"):
+            row["cog_code_actuel"] = result["identites"][-1] if len(result["identites"]) > 1 else ""
+
+    print(file=sys.stderr)
+    _write_table(output_path, out_fields, rows)
+    print(f"{S.GR}✓{S.R} Enrichi : {output_path} ({total} lignes)")
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -871,12 +1000,16 @@ def main():
         epilog="""
 Exemples :
   %(prog)s 01015                          Fiche + historique
+  %(prog)s --nom Entrelacs                Recherche par nom
   %(prog)s 73010 --html entrelacs.html    Arbre HTML d'une commune
   %(prog)s --dep 73 --html savoie.html    Arbre HTML d'un département
   %(prog)s --arr 73-1 --html arr.html     Arbre HTML d'un arrondissement
   %(prog)s --canton 73-05 --html can.html Arbre HTML d'un canton
+  %(prog)s --enrichir codes.xlsx --col code_insee --out enrichi.xlsx
+  %(prog)s --enrichir codes.csv --col INSEE --out enrichi.csv
         """)
     p.add_argument("code_insee", nargs="?", help="Code INSEE (ex: 01015, 69008)")
+    p.add_argument("--nom", metavar="NOM", help="Rechercher par nom de commune")
     p.add_argument("--depuis", type=int, metavar="ANNEE")
     p.add_argument("--json", action="store_true")
     p.add_argument("--download", action="store_true")
@@ -887,6 +1020,11 @@ Exemples :
     p.add_argument("--dep", metavar="DEP", help="Département (ex: 73)")
     p.add_argument("--arr", metavar="DEP-ARR", help="Arrondissement (ex: 73-1)")
     p.add_argument("--canton", metavar="DEP-CAN", help="Canton (ex: 73-05)")
+    p.add_argument("--enrichir", metavar="FICHIER",
+                   help="Enrichir un CSV/XLSX avec les infos communales")
+    p.add_argument("--col", metavar="COLONNE", default="code_insee",
+                   help="Colonne code INSEE dans le fichier (défaut: code_insee)")
+    p.add_argument("--out", metavar="FICHIER", help="Fichier de sortie")
     a = p.parse_args()
 
     if a.download:
@@ -899,7 +1037,30 @@ Exemples :
 
     if a.stats:
         show_stats(db)
-        if not a.code_insee and not a.html: return
+        if not a.code_insee and not a.html and not a.nom and not a.enrichir: return
+
+    # ── Mode enrichissement CSV/XLSX ──
+    if a.enrichir:
+        inp = Path(a.enrichir)
+        out = Path(a.out) if a.out else inp.with_stem(inp.stem + "_enrichi")
+        enrichir_fichier(inp, out, a.col, annuaire, db, depuis=a.depuis)
+        return
+
+    # ── Mode recherche par nom ──
+    if a.nom:
+        results = annuaire.search_name(a.nom)
+        if not results:
+            print(f"{S.RD}Aucune commune trouvée pour '{a.nom}'.{S.R}"); return
+        print(f"\n{S.B}  Résultats pour « {a.nom} » ({len(results)}){S.R}\n")
+        for f in results:
+            t = Tracer(db).trace(f.code)
+            n_evt = len(t["directs"])
+            n_abs = count_abs(t["absorbees"])
+            tag = f"{S.D}({n_evt} évt, {n_abs} abs.){S.R}" if n_evt else ""
+            print(f"  {S.B}{f.code}{S.R}  {f.libelle}  {S.D}{f.dep_nom} ({f.dep_code}){S.R}  "
+                  f"{S.D}[{f.typecom}]{S.R}  {tag}")
+        print(f"\n  {S.D}Utilisez un code pour voir le détail : python {__file__} <CODE>{S.R}\n")
+        return
 
     # ── Mode HTML ──
     if a.html:
