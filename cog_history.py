@@ -419,6 +419,7 @@ box-shadow:0 4px 12px rgba(0,0,0,.15);white-space:pre-line;line-height:1.6}
 <span><i style="background:var(--gray)"></i>Absorbée</span>
 <span><i style="background:var(--coral)"></i>Fusion</span>
 <span><i style="background:var(--cyan)"></i>Changement nom/code</span>
+<span><i style="background:var(--cyan);border:1px dashed var(--cyan)"></i>Succession de code</span>
 </div>
 </div>
 <div id="container"><svg id="timeline"></svg></div>
@@ -445,21 +446,45 @@ DATA.events.forEach(e => {
   }
 });
 
+// Changements de code (MOD 41/50) — l'ancien code disparaît, le nouveau prend le relais
+const MOD_CODE = new Set([41, 50]);
+const codeChangedTo = {};
+const codeCreatedBy = {};  // inverse : nouveau code → {from, date}
+DATA.events.forEach(e => {
+  if (MOD_CODE.has(e.mod) && e.com_av !== e.com_ap) {
+    codeChangedTo[e.com_av] = {into: e.com_ap, date: e.date, mod_label: e.mod_label};
+    codeCreatedBy[e.com_ap] = {from: e.com_av, date: e.date, mod_label: e.mod_label};
+  }
+});
+
+// Un code est "terminé" s'il a été absorbé OU a changé de code
+function endInfo(code) {
+  return absorbedInto[code] || codeChangedTo[code] || null;
+}
+
+// Année de début effective d'un code (minYear sauf si né d'un changement de code)
+function startYear(code) {
+  const created = codeCreatedBy[code];
+  return created ? dateToYear(created.date) : minYear;
+}
+
 // Identifier les communes nouvelles
 const communeNouvelle = new Set();
 DATA.events.forEach(e => {
   if (e.mod === 32 && e.com_av !== e.com_ap) communeNouvelle.add(e.com_ap);
 });
 
-// Trier : COM en premier, regrouper enfants sous parent
+// Trier : COM en premier, regrouper enfants sous parent (absorptions + changements de code)
 function buildOrder() {
   const parents = [];
   const childrenOf = {};
   DATA.communes.forEach(c => {
     const abs = absorbedInto[c.code];
-    if (abs && communeMap[abs.into]) {
-      if (!childrenOf[abs.into]) childrenOf[abs.into] = [];
-      childrenOf[abs.into].push(c);
+    const chg = codeChangedTo[c.code];
+    const target = abs ? abs.into : (chg ? chg.into : null);
+    if (target && communeMap[target]) {
+      if (!childrenOf[target]) childrenOf[target] = [];
+      childrenOf[target].push(c);
     } else {
       parents.push(c);
     }
@@ -557,7 +582,9 @@ function render() {
 
     // Build segments: detect name changes on same code
     const abs = absorbedInto[c.code];
-    const endYear = abs ? dateToYear(abs.date) : NOW_YEAR;
+    const chg = codeChangedTo[c.code];
+    const end = endInfo(c.code);
+    const endYear = end ? dateToYear(end.date) : NOW_YEAR;
 
     // Collect rename events for this code (MOD 10 or MOD 32 where com_av==com_ap and name differs)
     const renames = [];
@@ -572,11 +599,12 @@ function render() {
 
     // Build segments from renames
     const segments = [];
+    const cStart = startYear(c.code);
     if (renames.length === 0) {
-      segments.push({name: c.name, from: minYear, to: endYear, isNew: communeNouvelle.has(c.code) && !abs});
+      segments.push({name: c.name, from: cStart, to: endYear, isNew: communeNouvelle.has(c.code) && !abs});
     } else {
       // First segment: from start to first rename
-      segments.push({name: renames[0].nameBefore, from: minYear, to: renames[0].date, isNew: false});
+      segments.push({name: renames[0].nameBefore, from: cStart, to: renames[0].date, isNew: false});
       // Middle segments
       for (let j = 0; j < renames.length - 1; j++) {
         const isNew = renames[j].mod === 32 || renames[j].mod === 34;
@@ -597,6 +625,7 @@ function render() {
       let color = "var(--teal)";
       let opacity = 0.6;
       if (abs && seg.to <= endYear && !seg.isNew) { color = "var(--gray)"; opacity = 0.4; }
+      if (chg && !seg.isNew) { color = "var(--gray)"; opacity = 0.4; }
       if (seg.isNew) { color = "var(--purple)"; opacity = 0.7; }
       if (c.ghost) { color = "var(--fg3)"; opacity = 0.3; }
 
@@ -605,7 +634,8 @@ function render() {
 
       let tipText = `${c.code} ${seg.name}`;
       tipText += `\n${Math.round(seg.from)} – ${seg.to >= NOW_YEAR ? "auj." : Math.round(seg.to)}`;
-      if (abs && seg.to <= endYear + 0.1) tipText += `\nAbsorbée → ${abs.into} le ${abs.date}`;
+      if (abs) tipText += `\nAbsorbée → ${abs.into} le ${abs.date}`;
+      if (chg) tipText += `\nDevenu ${chg.into} le ${chg.date} (${chg.mod_label})`;
       bar.dataset.tip = tipText;
 
       // Name label on segment if wide enough
@@ -627,7 +657,7 @@ function render() {
       const eYear = dateToYear(e.date);
       const ex = yearToX(eYear, timeW);
       const barEndX = yearToX(Math.min(endYear, maxYear), timeW);
-      const barStartX = yearToX(minYear, timeW);
+      const barStartX = yearToX(Math.max(cStart, minYear), timeW);
       if (ex < barStartX || ex > barEndX) return;
 
       let mc = "var(--coral)";
@@ -641,7 +671,7 @@ function render() {
     });
   });
 
-  // Merge lines
+  // Merge lines (absorptions)
   DATA.events.forEach(e => {
     if (!MOD_ABS.has(e.mod) || e.com_av === e.com_ap) return;
     if (!(e.com_av in rowY) || !(e.com_ap in rowY)) return;
@@ -660,6 +690,32 @@ function render() {
     path.setAttribute("stroke-width", "1.2");
     path.setAttribute("opacity", "0.35");
     path.classList.add("merge-line");
+    svg.appendChild(path);
+  });
+
+  // Code change lines (MOD 41/50) — dashed cyan
+  DATA.events.forEach(e => {
+    if (!MOD_CODE.has(e.mod) || e.com_av === e.com_ap) return;
+    if (!(e.com_av in rowY) || !(e.com_ap in rowY)) return;
+
+    const eYear = dateToYear(e.date);
+    const x = yearToX(eYear, timeW);
+    const y1 = rowY[e.com_av] + ROW_H / 2;
+    const y2 = rowY[e.com_ap] + ROW_H / 2;
+    const dist = Math.abs(y2 - y1);
+    const cpx = x + Math.min(30, dist * 0.3);
+
+    const path = document.createElementNS(NS, "path");
+    path.setAttribute("d", `M${x} ${y1} C${cpx} ${y1} ${cpx} ${y2} ${x} ${y2}`);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", "var(--cyan)");
+    path.setAttribute("stroke-width", "1.5");
+    path.setAttribute("stroke-dasharray", "4 3");
+    path.setAttribute("opacity", "0.6");
+    path.classList.add("merge-line");
+    path.dataset.tip = `${e.date}\n${e.mod_label}\n${e.com_av} ${e.lib_av} → ${e.com_ap} ${e.lib_ap}`;
+    path.style.pointerEvents = "stroke";
+    path.style.cursor = "pointer";
     svg.appendChild(path);
   });
 
@@ -727,8 +783,11 @@ document.getElementById("search").addEventListener("input", function() {
     // Also include parents of matched children and children of matched parents
     allRows.forEach(c => {
       const abs = absorbedInto[c.code];
+      const chg = codeChangedTo[c.code];
       if (abs && matched.has(abs.into)) matched.add(c.code);
+      if (chg && matched.has(chg.into)) matched.add(c.code);
       if (matched.has(c.code) && abs) matched.add(abs.into);
+      if (matched.has(c.code) && chg) matched.add(chg.into);
     });
     filteredRows = allRows.filter(c => matched.has(c.code));
   }
@@ -738,10 +797,13 @@ document.getElementById("zoom").addEventListener("input", render);
 
 // ── Init ──
 document.getElementById("title").textContent = DATA.title;
-const nActive = DATA.communes.filter(c => !absorbedInto[c.code] && c.type === "COM").length;
+const nActive = DATA.communes.filter(c => !absorbedInto[c.code] && !codeChangedTo[c.code] && c.type === "COM").length;
 const nAbsorbed = Object.keys(absorbedInto).length;
-document.getElementById("stats").textContent =
-  `${DATA.communes.length} communes · ${nActive} actives · ${nAbsorbed} absorbées · ${DATA.events.length} événements`;
+const nCodeChanged = Object.keys(codeChangedTo).length;
+let statsText = `${DATA.communes.length} communes · ${nActive} actives · ${nAbsorbed} absorbées`;
+if (nCodeChanged) statsText += ` · ${nCodeChanged} changement(s) de code`;
+statsText += ` · ${DATA.events.length} événements`;
+document.getElementById("stats").textContent = statsText;
 render();
 </script>
 </body>
@@ -860,20 +922,27 @@ Exemples :
             title = f"Canton {nom} ({a.canton})"
         elif a.code_insee:
             code = a.code_insee.strip().zfill(5)
-            fiche = annuaire.get(code)
-            nom = fiche.libelle if fiche else code
-            # Inclure la commune + toutes celles absorbées
             tracer = Tracer(db, depuis=a.depuis)
             r = tracer.trace(code)
-            all_codes = [code] + list(r["absorbees"].keys())
-            # Ajouter récursivement les sous-absorptions
+            # Inclure : code demandé + identités successives + absorbées (récursif)
+            all_codes = list(r["identites"])  # inclut le code d'origine + successeurs
+            all_codes += list(r["absorbees"].keys())
             def collect_subs(d):
                 for k, v in d.items():
                     all_codes.append(k)
                     collect_subs(v.get("sub", {}))
             collect_subs(r["absorbees"])
-            fiches = [annuaire.get(c) for c in set(all_codes) if annuaire.get(c)]
-            title = f"{code} {nom}"
+            # Pour chaque identité successive, tracer aussi ses absorbées
+            for id_code in r["identites"][1:]:
+                r2 = tracer.trace(id_code)
+                all_codes += list(r2["absorbees"].keys())
+                collect_subs(r2["absorbees"])
+            unique_codes = list(dict.fromkeys(all_codes))  # dédouble en gardant l'ordre
+            fiches = [annuaire.get(c) for c in unique_codes if annuaire.get(c)]
+            # Titre : prendre le nom actuel (dernier de la chaîne d'identité)
+            last_fiche = annuaire.get(r["identites"][-1])
+            nom = last_fiche.libelle if last_fiche else code
+            title = f"{code} {nom}" if len(r["identites"]) == 1 else f"{code} → {r['identites'][-1]} {nom}"
         else:
             print(f"{S.RD}Spécifiez un code, --dep, --arr ou --canton avec --html{S.R}")
             sys.exit(1)
