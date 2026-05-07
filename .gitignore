@@ -1,0 +1,21 @@
+# Données COG téléchargées depuis l'INSEE
+data/
+
+# Visualisations HTML générées
+html/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
